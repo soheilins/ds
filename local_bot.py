@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import subprocess
-import json
+from llama_cpp import Llama
 
 # -------------------- Configuration --------------------
 TOKEN = os.environ.get("RUBIKA_TOKEN", "").strip()
@@ -10,29 +10,22 @@ if not TOKEN:
     print("FATAL: RUBIKA_TOKEN is empty.", flush=True)
     exit(1)
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-if not DEEPSEEK_API_KEY:
-    print("FATAL: DEEPSEEK_API_KEY is empty.", flush=True)
-    exit(1)
-
 POLL_INTERVAL = 3                # seconds between getUpdates
 RUN_DURATION = 5 * 3600 + 55 * 60  # 5h 55m
 COMMIT_INTERVAL = 20 * 60        # push offset every 20 min
 OFFSET_FILE = "offset.txt"
+MODEL_FILE = "model.gguf"
 
-# Optional HTTP proxy (for GitHub runners that can't reach Rubika)
+# Optional proxy for Rubika (not for model, model is local)
 PROXY_URL = os.environ.get("PROXY_URL")
 proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
-# Maximum conversation history (last N user+assistant pairs)
-MAX_HISTORY = 20
+# How many chat turns to remember (system + user + assistant)
+MAX_HISTORY = 10
 
 BASE_RUBIKA = f"https://botapi.rubika.ir/v3/{TOKEN}"
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# --------------------------------------------------------
-
-# ---------- Git helpers (for periodic offset push) ----------
+# -------------------- Git helpers --------------------
 def setup_git():
     subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=False)
     subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=False)
@@ -42,14 +35,14 @@ def git_commit_and_push():
         subprocess.run(["git", "add", OFFSET_FILE], check=True)
         r = subprocess.run(["git", "diff", "--staged", "--quiet"], capture_output=True)
         if r.returncode == 0:
-            return   # no changes
+            return
         subprocess.run(["git", "commit", "-m", "Update offset"], check=True)
         subprocess.run(["git", "push"], check=True)
         print("[GIT] Offset committed and pushed.", flush=True)
     except Exception as e:
         print(f"[GIT] Push failed: {e}", flush=True)
 
-# ---------- Rubika API ----------
+# -------------------- Rubika API --------------------
 def api_call(method, payload=None):
     url = f"{BASE_RUBIKA}/{method}"
     for attempt in range(3):
@@ -66,7 +59,6 @@ def api_call(method, payload=None):
     return None, "unknown"
 
 def send_rubika_message(chat_id, text):
-    # Rubika has a message length limit (~4096 chars). Split if needed.
     CHUNK_SIZE = 4000
     if len(text) <= CHUNK_SIZE:
         code, _ = api_call("sendMessage", {"chat_id": chat_id, "text": text})
@@ -75,71 +67,80 @@ def send_rubika_message(chat_id, text):
         else:
             print(f"[FAIL] sendMessage {code}", flush=True)
     else:
-        # Split into chunks (simple, could break words, but acceptable)
-        chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-        for idx, chunk in enumerate(chunks):
+        for i in range(0, len(text), CHUNK_SIZE):
+            chunk = text[i:i+CHUNK_SIZE]
             code, _ = api_call("sendMessage", {"chat_id": chat_id, "text": chunk})
             if code != 200:
-                print(f"[FAIL] chunk {idx} send failed", flush=True)
+                print(f"[FAIL] chunk send failed", flush=True)
                 break
-            time.sleep(0.5)  # slight delay to avoid flooding
+            time.sleep(0.5)
 
-# ---------- DeepSeek API ----------
-def query_deepseek(messages):
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "deepseek-chat",
-        "messages": messages,
-        "temperature": 0.7,
-        "stream": False
-    }
-    for attempt in range(2):
-        try:
-            resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            else:
-                print(f"[DeepSeek] Error {resp.status_code}: {resp.text}", flush=True)
-                return f"❌ DeepSeek API error ({resp.status_code})."
-        except Exception as e:
-            print(f"[DeepSeek] Exception: {e}", flush=True)
-            if attempt == 1:
-                return "⚠️ DeepSeek is not responding. Try again."
-            time.sleep(3)
-    return "⚠️ Unexpected error."
-
-# ---------- Conversation storage ----------
+# -------------------- Conversation store --------------------
 conversations = {}   # chat_id -> list of {"role": ..., "content": ...}
 
 def get_history(chat_id):
     if chat_id not in conversations:
-        # Start with a system message only when first seen
         conversations[chat_id] = [
-            {"role": "system", "content": "You are a helpful assistant. Answer concisely."}
+            {"role": "system", "content": "You are a helpful, polite assistant. Answer concisely."}
         ]
     return conversations[chat_id]
 
 def trim_history(history):
-    """Keep only the last MAX_HISTORY messages (excluding system)."""
     system = [m for m in history if m["role"] == "system"]
     rest = [m for m in history if m["role"] != "system"]
-    if len(rest) > MAX_HISTORY:
-        rest = rest[-MAX_HISTORY:]
+    if len(rest) > MAX_HISTORY * 2:   # paired user+assistant
+        rest = rest[-(MAX_HISTORY * 2):]
     return system + rest
 
-# ---------- Main loop ----------
+# -------------------- LLM --------------------
+def load_model():
+    if not os.path.exists(MODEL_FILE):
+        print(f"ERROR: Model file '{MODEL_FILE}' not found.", flush=True)
+        exit(1)
+    print("Loading model (this may take a moment)...", flush=True)
+    return Llama(
+        model_path=MODEL_FILE,
+        n_ctx=2048,        # context window
+        n_threads=2,       # GitHub has 2 cores
+        verbose=False
+    )
+
+model = load_model()
+
+def generate_reply(messages):
+    # Format messages into TinyLlama chat format (it uses <|user|> and <|assistant|>)
+    # The template from TheBloke: " <|user|>\n{user_msg} </s> <|assistant|>\n{assistant_msg}"
+    prompt_parts = []
+    for m in messages:
+        if m["role"] == "system":
+            # TinyLlama doesn't have system, prepend as user note
+            prompt_parts.append(f"<|system|>\n{m['content']}</s>")
+        elif m["role"] == "user":
+            prompt_parts.append(f"<|user|>\n{m['content']}</s>")
+        elif m["role"] == "assistant":
+            prompt_parts.append(f"<|assistant|>\n{m['content']}</s>")
+    prompt = "\n".join(prompt_parts) + "\n<|assistant|>\n"
+
+    output = model(
+        prompt,
+        max_tokens=512,
+        temperature=0.7,
+        top_p=0.9,
+        stop=["</s>", "<|user|>"],
+        echo=False
+    )
+    reply = output["choices"][0]["text"].strip()
+    return reply
+
+# -------------------- Main loop --------------------
 def main():
     start_time = time.time()
     last_commit = start_time
 
     setup_git()
-    print("DeepSeek Rubika bot starting.", flush=True)
+    print("Local chatbot starting.", flush=True)
 
-    # Test token
+    # Verify token
     code, info = api_call("getMe")
     if code == 200 and isinstance(info, dict):
         bot = info.get("data", {}).get("bot", {})
@@ -156,10 +157,10 @@ def main():
         code, data = api_call("getUpdates", {"limit": 1})
         if code == 200 and isinstance(data, dict):
             next_offset_str = data.get("data", {}).get("next_offset_id")
-
     print(f"Offset: {next_offset_str}", flush=True)
 
-    # Main polling loop
+    print("Bot is ready.", flush=True)
+
     try:
         while time.time() - start_time < RUN_DURATION:
             payload = {"limit": 10}
@@ -185,38 +186,36 @@ def main():
                         if not text or not chat_id:
                             continue
 
-                        # --- Special commands ---
+                        # Reset command
                         if text == "/reset":
                             conversations.pop(chat_id, None)
-                            send_rubika_message(chat_id, "🧹 Conversation history cleared.")
+                            send_rubika_message(chat_id, "🧹 Conversation cleared.")
                             continue
 
-                        # --- Normal chat ---
-                        # Get conversation history
+                        # Build history
                         history = get_history(chat_id)
-                        # Append user message
                         history.append({"role": "user", "content": text})
-                        # Trim to manageable length
                         history = trim_history(history)
-                        conversations[chat_id] = history   # update ref
+                        conversations[chat_id] = history
 
-                        # Send to DeepSeek
-                        reply = query_deepseek(history)
+                        # Generate reply
+                        try:
+                            reply = generate_reply(history)
+                        except Exception as e:
+                            print(f"Generation error: {e}", flush=True)
+                            reply = "⚠️ Model error, please try again."
 
-                        # Append assistant response
                         history.append({"role": "assistant", "content": reply})
                         conversations[chat_id] = history
 
-                        # Reply to user
                         send_rubika_message(chat_id, reply)
 
-                # Save offset immediately after poll
                 if new_offset_str:
                     next_offset_str = new_offset_str
                     with open(OFFSET_FILE, "w") as f:
                         f.write(next_offset_str)
 
-                # Periodic git push
+                # Periodic push
                 now = time.time()
                 if now - last_commit >= COMMIT_INTERVAL:
                     git_commit_and_push()
