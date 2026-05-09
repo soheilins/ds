@@ -16,12 +16,10 @@ COMMIT_INTERVAL = 20 * 60        # push offset every 20 min
 OFFSET_FILE = "offset.txt"
 MODEL_FILE = "model.gguf"
 
-# Optional proxy for Rubika (not for model, model is local)
 PROXY_URL = os.environ.get("PROXY_URL")
 proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
-# How many chat turns to remember (system + user + assistant)
-MAX_HISTORY = 10
+MAX_HISTORY = 8   # keep fewer turns to stay within context window
 
 BASE_RUBIKA = f"https://botapi.rubika.ir/v3/{TOKEN}"
 
@@ -76,57 +74,53 @@ def send_rubika_message(chat_id, text):
             time.sleep(0.5)
 
 # -------------------- Conversation store --------------------
-conversations = {}   # chat_id -> list of {"role": ..., "content": ...}
+conversations = {}   # chat_id -> list of {"role": "user"/"assistant", "content": ...}
 
 def get_history(chat_id):
+    # Start with a system instruction (only once per chat)
     if chat_id not in conversations:
-        conversations[chat_id] = [
-            {"role": "system", "content": "You are a helpful, polite assistant. Answer concisely."}
-        ]
+        conversations[chat_id] = []
     return conversations[chat_id]
 
 def trim_history(history):
-    system = [m for m in history if m["role"] == "system"]
-    rest = [m for m in history if m["role"] != "system"]
-    if len(rest) > MAX_HISTORY * 2:   # paired user+assistant
-        rest = rest[-(MAX_HISTORY * 2):]
-    return system + rest
+    # Keep only the last MAX_HISTORY pairs (user+assistant)
+    if len(history) > MAX_HISTORY * 2:
+        history = history[-(MAX_HISTORY * 2):]
+    return history
 
-# -------------------- LLM --------------------
-def load_model():
-    if not os.path.exists(MODEL_FILE):
-        print(f"ERROR: Model file '{MODEL_FILE}' not found.", flush=True)
-        exit(1)
-    print("Loading model (this may take a moment)...", flush=True)
-    return Llama(
-        model_path=MODEL_FILE,
-        n_ctx=2048,        # context window
-        n_threads=2,       # GitHub has 2 cores
-        verbose=False
-    )
+# -------------------- LLM (DeepSeek-Coder) --------------------
+model = Llama(
+    model_path=MODEL_FILE,
+    n_ctx=2048,
+    n_threads=2,
+    verbose=False
+)
 
-model = load_model()
-
-def generate_reply(messages):
-    # Format messages into TinyLlama chat format (it uses <|user|> and <|assistant|>)
-    # The template from TheBloke: " <|user|>\n{user_msg} </s> <|assistant|>\n{assistant_msg}"
-    prompt_parts = []
-    for m in messages:
-        if m["role"] == "system":
-            # TinyLlama doesn't have system, prepend as user note
-            prompt_parts.append(f"<|system|>\n{m['content']}</s>")
-        elif m["role"] == "user":
-            prompt_parts.append(f"<|user|>\n{m['content']}</s>")
-        elif m["role"] == "assistant":
-            prompt_parts.append(f"<|assistant|>\n{m['content']}</s>")
-    prompt = "\n".join(prompt_parts) + "\n<|assistant|>\n"
+def generate_code_reply(history):
+    """
+    Format chat history for DeepSeek-Coder-Instruct.
+    Template:
+    You are an AI programming assistant, utilizing the DeepSeek Coder model...
+    ### Instruction:
+    {user message}
+    ### Response:
+    {model reply}
+    (continue alternating)
+    """
+    prompt = "You are an AI programming assistant, utilizing the DeepSeek Coder model. Answer coding questions concisely and provide clear code examples.\n\n"
+    for msg in history:
+        if msg["role"] == "user":
+            prompt += f"### Instruction:\n{msg['content']}\n"
+        else:  # assistant
+            prompt += f"### Response:\n{msg['content']}\n"
+    prompt += "### Response:\n"
 
     output = model(
         prompt,
         max_tokens=512,
-        temperature=0.7,
+        temperature=0.2,   # lower temperature for code
         top_p=0.9,
-        stop=["</s>", "<|user|>"],
+        stop=["### Instruction:", "### Response:"],
         echo=False
     )
     reply = output["choices"][0]["text"].strip()
@@ -138,7 +132,7 @@ def main():
     last_commit = start_time
 
     setup_git()
-    print("Local chatbot starting.", flush=True)
+    print("Code bot starting.", flush=True)
 
     # Verify token
     code, info = api_call("getMe")
@@ -148,7 +142,7 @@ def main():
     else:
         print("Warning: getMe failed, continuing.", flush=True)
 
-    # Load latest offset
+    # Load offset
     next_offset_str = None
     if os.path.exists(OFFSET_FILE):
         with open(OFFSET_FILE) as f:
@@ -158,8 +152,7 @@ def main():
         if code == 200 and isinstance(data, dict):
             next_offset_str = data.get("data", {}).get("next_offset_id")
     print(f"Offset: {next_offset_str}", flush=True)
-
-    print("Bot is ready.", flush=True)
+    print("Bot ready – ask coding questions.", flush=True)
 
     try:
         while time.time() - start_time < RUN_DURATION:
@@ -186,10 +179,9 @@ def main():
                         if not text or not chat_id:
                             continue
 
-                        # Reset command
                         if text == "/reset":
                             conversations.pop(chat_id, None)
-                            send_rubika_message(chat_id, "🧹 Conversation cleared.")
+                            send_rubika_message(chat_id, "🧹 Conversation cleared. New session started.")
                             continue
 
                         # Build history
@@ -198,9 +190,9 @@ def main():
                         history = trim_history(history)
                         conversations[chat_id] = history
 
-                        # Generate reply
+                        # Generate code-focused reply
                         try:
-                            reply = generate_reply(history)
+                            reply = generate_code_reply(history)
                         except Exception as e:
                             print(f"Generation error: {e}", flush=True)
                             reply = "⚠️ Model error, please try again."
