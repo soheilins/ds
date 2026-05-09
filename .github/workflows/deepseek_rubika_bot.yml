@@ -1,17 +1,17 @@
-name: DeepSeek Rubika Chatbot
+name: Rubika Local Chatbot
 
 on:
   schedule:
-    - cron: '0 */6 * * *'       # every 6 hours
-  workflow_dispatch:            # manual trigger
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 permissions:
-  contents: write               # needed for pushing offset
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360         # max 6 hours
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v3
@@ -22,13 +22,28 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Install Python packages
+        run: pip install requests llama-cpp-python
+
+      - name: Cache model file
+        id: cache-model
+        uses: actions/cache@v3
+        with:
+          path: model.gguf
+          key: tinyllama-chat-v1.0-q4km
+
+      - name: Download model if not cached
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          wget -O model.gguf https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
       - name: Run bot
         env:
           RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          # Optional proxy for geo‑blocked GitHub IPs
-          # PROXY_URL: ${{ secrets.PROXY_URL }}
-        run: python deepseek_bot.py
+          # PROXY_URL: ${{ secrets.PROXY_URL }}   # uncomment if needed
+        run: python local_bot.py
